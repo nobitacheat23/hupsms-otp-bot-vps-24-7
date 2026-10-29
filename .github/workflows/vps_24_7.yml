@@ -1,0 +1,88 @@
+name: Cloud VPS 24/7 (HupSMS OTP Bot)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '*/25 * * * *'
+
+concurrency:
+  group: hupsms-otp-bot-24-7-singleton
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run-bot-24-7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout Bot & Database
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Bot 24/7 with Auto-DB-Backup (5h30m cycle)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          git config user.name "HupSMS Auto-Save"
+          git config user.email "bot@users.noreply.github.com"
+
+          python watchdog.py &
+          BOT_PID=$!
+
+          START_TS=$(date +%s)
+          MAX_SEC=19800  # 5 tiếng 30 phút
+
+          while kill -0 $BOT_PID 2>/dev/null; do
+            sleep 60
+            NOW_TS=$(date +%s)
+            ELAPSED=$((NOW_TS - START_TS))
+
+            # Sao lưu Database hupsms_otp.db lên Cloud định kỳ mỗi 5 phút
+            if [ $((ELAPSED % 300)) -lt 65 ]; then
+              python -c "import sqlite3; c=sqlite3.connect('hupsms_otp.db'); c.execute('PRAGMA wal_checkpoint(PASSIVE)'); c.close()" || true
+              git add hupsms_otp.db
+              if ! git diff --staged --quiet; then
+                git commit -m "Auto-sync hupsms_otp.db [skip ci]" || true
+                git pull --rebase origin main || true
+                git push origin main || true
+              fi
+            fi
+
+            if [ $ELAPSED -ge $MAX_SEC ]; then
+              echo "Cycle complete, handing over to next 24/7 instance..."
+              kill -TERM $BOT_PID 2>/dev/null || true
+              sleep 3
+              break
+            fi
+          done
+
+      - name: Save Database & Handover
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -c "import sqlite3; c=sqlite3.connect('hupsms_otp.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" || true
+          git add hupsms_otp.db
+          if ! git diff --staged --quiet; then
+            git commit -m "Final sync hupsms_otp.db before handover [skip ci]" || true
+            git pull --rebase origin main || true
+            git push origin main || true
+          fi
+          gh workflow run "vps_24_7.yml" --ref main || true
